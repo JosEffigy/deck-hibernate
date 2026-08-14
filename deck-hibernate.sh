@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # CachyOS/Arch handheld suspend -> hibernate setup.
 # Prompts only for sudo authentication, the delay, and the final keypress.
 # Designed to be re-runnable.
-# Version: release-1.0
+# Version: release-1.0.1
 
 DEFAULT_DELAY_MINUTES=15
 HIBERNATE_DELAY="${DEFAULT_DELAY_MINUTES}min"
@@ -86,9 +86,10 @@ mkdir -p "$BACKUP_DIR"
 
 CURRENT_STEP="initialization"
 SETUP_SUCCEEDED=0
+FAILURE_REPORTED=0
 on_exit() {
     local rc=$?
-    if (( rc != 0 && SETUP_SUCCEEDED == 0 )); then
+    if (( rc != 0 && SETUP_SUCCEEDED == 0 && FAILURE_REPORTED == 0 )); then
         printf '\nSetup failed during: %s\nSee %s for details.\n' "$CURRENT_STEP" "$LOG_FILE" >&4
     fi
 }
@@ -96,6 +97,7 @@ trap on_exit EXIT
 
 fail() {
     local rc=${1:-1}
+    FAILURE_REPORTED=1
     printf '\nSetup failed during: %s\nSee %s for details.\n' "$CURRENT_STEP" "$LOG_FILE" >&4
     exit "$rc"
 }
@@ -132,6 +134,7 @@ require_cmd sed
 require_cmd grep
 require_cmd stat
 require_cmd df
+require_cmd getconf
 require_cmd sync
 [[ -r /sys/power/state ]] || { echo '/sys/power/state is unavailable'; exit 1; }
 grep -qw disk /sys/power/state || { echo 'Running kernel does not expose hibernation (disk)'; exit 1; }
@@ -147,6 +150,10 @@ ROOT_FSTYPE="$(findmnt -n -o FSTYPE /)"
 ROOT_SOURCE="$(findmnt -n -o SOURCE /)"
 ROOT_SOURCE="${ROOT_SOURCE%%[*}"
 ROOT_SOURCE="$(readlink -f "$ROOT_SOURCE" 2>/dev/null || printf '%s' "$ROOT_SOURCE")"
+SWAP_MOUNT_TARGET="$(findmnt -n -o TARGET -T "$STATE_DIR")"
+SWAP_MOUNT_FSTYPE="$(findmnt -n -o FSTYPE -T "$STATE_DIR")"
+SWAP_MOUNT_SOURCE="$(findmnt -n -o SOURCE -T "$STATE_DIR")"
+SWAP_MOUNT_SOURCE="${SWAP_MOUNT_SOURCE%%[*}"
 MEM_KIB="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo)"
 [[ "$MEM_KIB" =~ ^[0-9]+$ ]] && (( MEM_KIB > 0 )) || { echo 'Could not determine RAM size'; exit 1; }
 IMAGE_BYTES=$(( MEM_KIB * 1024 * IMAGE_PERCENT / 100 ))
@@ -156,6 +163,7 @@ MIN_SWAP_KIB=$(( MIN_SWAP_GIB * 1024 * 1024 ))
 FALLBACK_SWAP_KIB=$(( IMAGE_BYTES / 1024 + 512 * 1024 ))
 
 log "Filesystem: $ROOT_FSTYPE ($ROOT_SOURCE)"
+log "Managed swap filesystem: $SWAP_MOUNT_FSTYPE ($SWAP_MOUNT_SOURCE mounted at $SWAP_MOUNT_TARGET)"
 log "RAM: ${MEM_KIB} KiB; image target: ${IMAGE_BYTES} bytes; preferred swap: ${TARGET_SWAP_KIB} KiB"
 
 # Detect whether a dm-crypt swap mapping is volatile/random-key and therefore unusable for hibernate.
@@ -221,23 +229,23 @@ fi
 
 CURRENT_STEP="preparing persistent hibernation swap"
 if [[ -z "$SWAP_PATH" ]]; then
-    case "$ROOT_FSTYPE" in
+    case "$SWAP_MOUNT_FSTYPE" in
         btrfs|ext2|ext3|ext4|xfs|f2fs)
             ;;
         *)
-            echo "No suitable persistent swap exists and automatic swapfile creation is not supported on root filesystem '$ROOT_FSTYPE'."
+            echo "No suitable persistent swap exists and automatic swapfile creation is not supported on '$SWAP_MOUNT_FSTYPE' at '$SWAP_MOUNT_TARGET'."
             exit 1
             ;;
     esac
 
-    AVAIL_KIB="$(df -Pk / | awk 'NR==2 {print $4}')"
+    AVAIL_KIB="$(df -Pk "$STATE_DIR" | awk 'NR==2 {print $4}')"
     NEED_KIB=$(( TARGET_SWAP_KIB + FREE_RESERVE_GIB * 1024 * 1024 ))
     (( AVAIL_KIB >= NEED_KIB )) || {
         echo "Not enough free space to create hibernation swap safely. Need ${NEED_KIB} KiB, have ${AVAIL_KIB} KiB."
         exit 1
     }
 
-    if [[ "$ROOT_FSTYPE" == btrfs ]]; then
+    if [[ "$SWAP_MOUNT_FSTYPE" == btrfs ]]; then
         require_cmd btrfs
         # A nested subvolume prevents root snapshots (Snapper) from trying to snapshot an active swapfile.
         if [[ ! -e "$SWAP_DIR" ]]; then
@@ -260,7 +268,10 @@ if [[ -z "$SWAP_PATH" ]]; then
     # Reuse our own valid swapfile on reruns; otherwise recreate only our managed path.
     if [[ -f "$SWAP_FILE" ]]; then
         if grep -Fq "$SWAP_FILE" /proc/swaps; then
-            swapoff "$SWAP_FILE" || true
+            swapoff "$SWAP_FILE" || {
+                echo "Could not disable active managed swapfile; refusing to remove it: $SWAP_FILE"
+                exit 1
+            }
         fi
         rm -f "$SWAP_FILE"
     fi
@@ -269,7 +280,7 @@ if [[ -z "$SWAP_PATH" ]]; then
     if mkswap --help 2>&1 | grep -q -- '--file'; then
         # util-linux >= 2.41: creates populated swapfiles and sets Btrfs NOCOW automatically.
         mkswap --file --size "$SWAP_BYTES" --label cachyos-hibernate "$SWAP_FILE"
-    elif [[ "$ROOT_FSTYPE" == btrfs ]]; then
+    elif [[ "$SWAP_MOUNT_FSTYPE" == btrfs ]]; then
         # CachyOS with Btrfs normally has btrfs-progs; this path is for older util-linux.
         btrfs filesystem mkswapfile --size "$SWAP_BYTES" --uuid clear "$SWAP_FILE"
         mkswap -L cachyos-hibernate "$SWAP_FILE"
@@ -351,7 +362,9 @@ if [[ "$SWAP_TYPE" == file || -f "$SWAP_PATH" ]]; then
         RESUME_OFFSET="$(btrfs inspect-internal map-swapfile -r "$SWAP_PATH")"
     else
         require_cmd filefrag
-        RESUME_OFFSET="$(filefrag -v "$SWAP_PATH" | awk '$1=="0:" {gsub(/\.\..*/, "", $4); print $4; exit}')"
+        PAGE_BYTES="$(getconf PAGESIZE)"
+        [[ "$PAGE_BYTES" =~ ^[0-9]+$ ]] && (( PAGE_BYTES > 0 )) || { echo 'Could not determine kernel page size'; exit 1; }
+        RESUME_OFFSET="$(filefrag -v -b"$PAGE_BYTES" "$SWAP_PATH" | awk '$1=="0:" {gsub(/\.\..*/, "", $4); print $4; exit}')"
     fi
     [[ "$RESUME_OFFSET" =~ ^[0-9]+$ ]] || { echo "Could not determine resume_offset for $SWAP_PATH"; exit 1; }
 else
@@ -361,16 +374,13 @@ else
 fi
 
 [[ -n "$RESUME_SPEC" ]] || { echo 'Could not determine resume device'; exit 1; }
-log "Resume location: $RESUME_SPEC offset=$RESUME_OFFSET"
+[[ -b "$RESUME_BLOCKDEV" ]] || { echo "Resume backing device is not a block device: $RESUME_BLOCKDEV"; exit 1; }
+log "Resume location: $RESUME_SPEC offset=$RESUME_OFFSET backing_device=$RESUME_BLOCKDEV"
 
-# Configure the current boot too. This is not a hibernate test; it only points the running kernel at the selected area.
-if [[ -w /sys/power/resume ]]; then
-    MAJMIN="$(lsblk -dn -o MAJ:MIN "$RESUME_BLOCKDEV" 2>/dev/null | head -n1 || true)"
-    if [[ -n "$MAJMIN" ]]; then
-        printf '%s' "$MAJMIN" > /sys/power/resume
-        [[ -w /sys/power/resume_offset ]] && printf '%s' "$RESUME_OFFSET" > /sys/power/resume_offset
-    fi
-fi
+# Do not write /sys/power/resume here. Its kernel handler immediately scans for
+# a hibernation image, and some kernels reject live reconfiguration with EINVAL.
+# The persistent resume= and resume_offset= parameters are installed below and
+# become active after the required reboot.
 
 CURRENT_STEP="configuring initramfs resume support"
 INITRAMFS_KIND=""
@@ -445,7 +455,7 @@ esac
 backup_file "$BOOT_CONF"
 
 "$PYTHON" - "$BOOT_KIND" "$BOOT_CONF" "$RESUME_SPEC" "$RESUME_OFFSET" <<'PY'
-import re, sys
+import os, re, stat, sys, tempfile
 kind, path, resume, offset = sys.argv[1:]
 with open(path, 'r', encoding='utf-8') as f:
     lines = f.readlines()
@@ -459,7 +469,7 @@ def clean(v):
 out = []
 changed = 0
 if kind == 'limine':
-    pat = re.compile(r'^(\s*KERNEL_CMDLINE\[[^\]]+\]\s*=\s*)(["\'])(.*)\2(\s*(?:#.*)?)$')
+    pat = re.compile(r'^(\s*KERNEL_CMDLINE\[[^\]]+\]\s*\+?=\s*)(["\'])(.*)\2(\s*(?:#.*)?)$')
     for line in lines:
         m = pat.match(line.rstrip('\n'))
         if m and not line.lstrip().startswith('#'):
@@ -468,7 +478,7 @@ if kind == 'limine':
         else:
             out.append(line)
     if not changed:
-        out.append(f'\nKERNEL_CMDLINE[default]="resume={resume} resume_offset={offset}"\n')
+        out.append(f'\nKERNEL_CMDLINE[default]+="resume={resume} resume_offset={offset}"\n')
         changed = 1
 elif kind in ('systemd-boot', 'grub'):
     var = 'LINUX_OPTIONS' if kind == 'systemd-boot' else 'GRUB_CMDLINE_LINUX_DEFAULT'
@@ -500,9 +510,29 @@ else:
     raise SystemExit('unsupported boot kind')
 if not changed:
     raise SystemExit('No boot configuration entries could be updated')
-with open(path, 'w', encoding='utf-8') as f:
-    f.writelines(out)
+
+directory = os.path.dirname(path) or '.'
+original = os.stat(path)
+fd, temporary = tempfile.mkstemp(prefix=f'.{os.path.basename(path)}.', dir=directory, text=True)
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.writelines(out)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(temporary, stat.S_IMODE(original.st_mode))
+    if hasattr(os, 'chown'):
+        os.chown(temporary, original.st_uid, original.st_gid)
+    os.replace(temporary, path)
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
 PY
+
+grep -Fq "resume=$RESUME_SPEC" "$BOOT_CONF" || { echo "Boot configuration is missing resume=$RESUME_SPEC"; exit 1; }
+grep -Fq "resume_offset=$RESUME_OFFSET" "$BOOT_CONF" || { echo "Boot configuration is missing resume_offset=$RESUME_OFFSET"; exit 1; }
 
 CURRENT_STEP="configuring suspend-then-hibernate behavior"
 mkdir -p /etc/systemd/sleep.conf.d "$SUSPEND_OVERRIDE_DIR"
@@ -592,7 +622,7 @@ CURRENT_STEP="final verification"
 # Verify persistent swap, service syntax, and that our generated config points to the intended mode.
 grep -Fq 'HibernateDelaySec=' "$SLEEP_CONF"
 grep -Fq 'suspend-then-hibernate' "$SUSPEND_OVERRIDE"
-systemd-analyze verify cachyos-hibernate-image-size.service systemd-suspend.service >/dev/null 2>&1 || true
+systemd-analyze verify "$IMAGE_SERVICE" >/dev/null
 
 if [[ "$SWAP_TYPE" == file || -f "$SWAP_PATH" ]]; then
     grep -Fq "$SWAP_PATH" /proc/swaps || { echo 'Selected swapfile is not active'; exit 1; }

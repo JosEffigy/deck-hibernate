@@ -52,8 +52,13 @@ bash deck-hibernate.sh
 
 After rebooting, use the device's normal suspend action. It should suspend first and hibernate after the selected delay.
 
+## Upgrading from 1.0
+
+Release 1.0 could stop at `printf: write error: Invalid argument` while calculating the resume location. Version 1.0.1 removes that unnecessary live-kernel write and relies on the persistent resume parameters that take effect after reboot. Rerun the online installer above to apply the fix.
+
 ## Files
 
 - `deck-hibernate.sh` — the main configuration script.
 - `install.sh` — a small online bootstrap installer.
+- `deck-hibernate-release-1.0.1.zip` — the current release archive.
 - `deck-hibernate-release-1.0.zip` — the original release archive.
