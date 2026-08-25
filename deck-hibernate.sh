@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # CachyOS/Arch handheld suspend -> hibernate setup.
 # Prompts only for sudo authentication, the delay, optional GRUB and battery choices, and the final keypress.
 # Designed to be re-runnable.
-# Version: release-1.0.3
+# Version: release-1.0.4
 
 DEFAULT_DELAY_MINUTES=15
 HIBERNATE_DELAY="${DEFAULT_DELAY_MINUTES}min"
@@ -25,8 +25,10 @@ SLEEP_CONF="/etc/systemd/sleep.conf.d/99-cachyos-handheld-suspend-then-hibernate
 SUSPEND_OVERRIDE_DIR="/etc/systemd/system/systemd-suspend.service.d"
 SUSPEND_OVERRIDE="$SUSPEND_OVERRIDE_DIR/99-cachyos-suspend-then-hibernate.conf"
 IMAGE_SERVICE="/etc/systemd/system/cachyos-hibernate-image-size.service"
-LOW_BATTERY_SCRIPT="/usr/local/lib/cachyos-handheld-hibernate/low-battery-hibernate"
+LOW_BATTERY_CHECK="/usr/local/lib/cachyos-handheld-hibernate/low-battery-check"
+LOW_BATTERY_WATCHER="/usr/local/lib/cachyos-handheld-hibernate/low-battery-watch"
 LOW_BATTERY_SERVICE="/etc/systemd/system/cachyos-hibernate-low-battery.service"
+# Kept only so a timer created by release 1.0.3 can be disabled on upgrade.
 LOW_BATTERY_TIMER="/etc/systemd/system/cachyos-hibernate-low-battery.timer"
 DRACUT_CONF="/etc/dracut.conf.d/99-cachyos-hibernate.conf"
 
@@ -82,12 +84,19 @@ ask_delay
 
 LOW_BATTERY_MODE=keep
 ask_low_battery() {
-    local reply
+    local reply already_enabled=0
+
+    if systemctl is-enabled --quiet cachyos-hibernate-low-battery.service 2>/dev/null || systemctl is-enabled --quiet cachyos-hibernate-low-battery.timer 2>/dev/null; then
+        # Rerunning the installer refreshes an existing setup, including migration
+        # from the release-1.0.3 polling timer to the event listener.
+        already_enabled=1
+        LOW_BATTERY_MODE=enable
+    fi
 
     compgen -G '/sys/class/power_supply/BAT*/capacity' >/dev/null || return 0
     [[ -r /dev/tty && -w /dev/tty ]] || return 0
 
-    if systemctl is-enabled --quiet cachyos-hibernate-low-battery.timer 2>/dev/null; then
+    if (( already_enabled )); then
         printf 'Automatic low-battery hibernation is already enabled. Keep it enabled? [Y/n] ' > /dev/tty
         read -r reply < /dev/tty || reply=""
         case "$reply" in
@@ -655,12 +664,14 @@ printf '%s' "$IMAGE_BYTES" > /sys/power/image_size
 case "$LOW_BATTERY_MODE" in
     enable)
         CURRENT_STEP="configuring low-battery hibernation"
-        mkdir -p "$(dirname "$LOW_BATTERY_SCRIPT")"
-        backup_file "$LOW_BATTERY_SCRIPT"
+        mkdir -p "$(dirname "$LOW_BATTERY_CHECK")"
+        backup_file "$LOW_BATTERY_CHECK"
+        backup_file "$LOW_BATTERY_WATCHER"
         backup_file "$LOW_BATTERY_SERVICE"
         backup_file "$LOW_BATTERY_TIMER"
+        systemctl disable --now cachyos-hibernate-low-battery.timer 2>/dev/null || true
 
-        cat > "$LOW_BATTERY_SCRIPT" <<EOF
+        cat > "$LOW_BATTERY_CHECK" <<EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -688,35 +699,67 @@ is_low_and_discharging || exit 0
 logger -t cachyos-hibernate-low-battery 'Battery is still low; starting emergency hibernation.'
 exec systemctl hibernate --ignore-inhibitors
 EOF
-        chmod 700 "$LOW_BATTERY_SCRIPT"
+        chmod 700 "$LOW_BATTERY_CHECK"
+
+        cat > "$LOW_BATTERY_WATCHER" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CHECKER=$LOW_BATTERY_CHECK
+
+# Check immediately in case the service starts after a battery event was missed.
+"\$CHECKER"
+
+watch_upower() {
+    dbus-monitor --system "type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',path_namespace='/org/freedesktop/UPower/devices'" |
+        while IFS= read -r line; do
+            [[ "\$line" == signal* ]] && "\$CHECKER"
+        done
+}
+
+watch_kernel_power_supply() {
+    udevadm monitor --kernel --subsystem-match=power_supply |
+        while IFS= read -r line; do
+            [[ "\$line" == *power_supply* ]] && "\$CHECKER"
+        done
+}
+
+case "\${1:-kernel}" in
+    upower) watch_upower ;;
+    kernel) watch_kernel_power_supply ;;
+    *) exit 2 ;;
+esac
+EOF
+        chmod 700 "$LOW_BATTERY_WATCHER"
+
+        LOW_BATTERY_EVENT_SOURCE=kernel
+        if command -v dbus-monitor >/dev/null 2>&1 && busctl --system list 2>/dev/null | awk '$1 == "org.freedesktop.UPower" {found=1} END {exit !found}'; then
+            LOW_BATTERY_EVENT_SOURCE=upower
+        elif ! command -v udevadm >/dev/null 2>&1; then
+            echo 'Neither UPower D-Bus monitoring nor udevadm is available for low-battery hibernation.'
+            exit 1
+        fi
 
         cat > "$LOW_BATTERY_SERVICE" <<EOF
 [Unit]
 Description=Hibernate CachyOS handheld on low battery
 
 [Service]
-Type=oneshot
-ExecStart=$LOW_BATTERY_SCRIPT
-EOF
-
-        cat > "$LOW_BATTERY_TIMER" <<'EOF'
-[Unit]
-Description=Check CachyOS handheld battery level
-
-[Timer]
-OnBootSec=15s
-OnUnitActiveSec=15s
-AccuracySec=5s
+Type=simple
+ExecStart=$LOW_BATTERY_WATCHER $LOW_BATTERY_EVENT_SOURCE
+Restart=always
+RestartSec=5s
 
 [Install]
-WantedBy=timers.target
+WantedBy=multi-user.target
 EOF
         systemctl daemon-reload
-        systemctl enable --now cachyos-hibernate-low-battery.timer
-        log "Automatic low-battery hibernation enabled at ${LOW_BATTERY_PERCENT}% after ${LOW_BATTERY_DELAY_SECONDS} seconds."
+        systemctl enable --now cachyos-hibernate-low-battery.service
+        log "Automatic low-battery hibernation enabled at ${LOW_BATTERY_PERCENT}% after ${LOW_BATTERY_DELAY_SECONDS} seconds using ${LOW_BATTERY_EVENT_SOURCE} events."
         ;;
     disable)
         CURRENT_STEP="disabling low-battery hibernation"
+        systemctl disable --now cachyos-hibernate-low-battery.service 2>/dev/null || true
         systemctl disable --now cachyos-hibernate-low-battery.timer 2>/dev/null || true
         log 'Automatic low-battery hibernation disabled.'
         ;;
@@ -770,8 +813,8 @@ grep -Fq 'HibernateDelaySec=' "$SLEEP_CONF"
 grep -Fq 'suspend-then-hibernate' "$SUSPEND_OVERRIDE"
 systemd-analyze verify "$IMAGE_SERVICE" >/dev/null
 if [[ "$LOW_BATTERY_MODE" == enable ]]; then
-    systemd-analyze verify "$LOW_BATTERY_SERVICE" "$LOW_BATTERY_TIMER" >/dev/null
-    systemctl is-enabled --quiet cachyos-hibernate-low-battery.timer
+    systemd-analyze verify "$LOW_BATTERY_SERVICE" >/dev/null
+    systemctl is-enabled --quiet cachyos-hibernate-low-battery.service
 fi
 
 if [[ "$SWAP_TYPE" == file || -f "$SWAP_PATH" ]]; then
@@ -795,6 +838,7 @@ INITRAMFS_KIND=$INITRAMFS_KIND
 LOW_BATTERY_MODE=$LOW_BATTERY_MODE
 LOW_BATTERY_PERCENT=$LOW_BATTERY_PERCENT
 LOW_BATTERY_DELAY_SECONDS=$LOW_BATTERY_DELAY_SECONDS
+LOW_BATTERY_EVENT_SOURCE=${LOW_BATTERY_EVENT_SOURCE:-unchanged}
 LAST_BACKUP=$BACKUP_DIR
 EOF
 chmod 600 "$STATE_DIR/state.env"
