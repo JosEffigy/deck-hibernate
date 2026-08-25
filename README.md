@@ -2,7 +2,7 @@
 
 ![Deck-Hibernate banner](assets/deck-hibernate-banner.png)
 
-Suspend-then-hibernate installer for CachyOS and Arch Linux gaming handhelds. It makes a device sleep normally, then hibernate after a while (15 minutes by default) to reduce battery drain and heat. It is suitable for Steam Deck hardware running CachyOS or another supported Arch-based setup.
+Suspend-then-hibernate installer for CachyOS/Arch gaming handhelds and Bazzite. It makes a device sleep normally, then hibernate after a while (15 minutes by default) to reduce battery drain and heat.
 
 ## Install
 
@@ -24,7 +24,8 @@ Enter your password when asked, choose how many minutes to wait, then reboot whe
 
 ## Before you run it
 
-- For CachyOS or Arch Linux only.
+- Supports CachyOS/Arch and Bazzite. Bazzite is detected automatically: versions before 44 use the pre-44 path; 44 and newer use the OpenGamepadUI/InputPlumber-era path.
+- On Bazzite, it creates a persistent Btrfs swapfile and disables zram so normal systemd hibernation can resume after a reboot. It does not use HHD, so pre-44 installs do not depend on HHD's dynamic hibernation.
 - You need internet and `curl` or `wget` for the online install.
 - It **does not** install missing packages. If a needed system tool is missing, it stops and tells you.
 - It changes sleep, swap, and boot settings. Reboot when it tells you to.
