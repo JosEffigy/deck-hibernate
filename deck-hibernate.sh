@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 # Deck-Hibernate
 # CachyOS/Arch handheld suspend -> hibernate setup.
-# Prompts only for sudo authentication, the delay, and the final keypress.
+# Prompts only for sudo authentication, the delay, an optional GRUB choice, and the final keypress.
 # Designed to be re-runnable.
 # Version: release-1.0.1
 
@@ -440,6 +440,19 @@ else
 fi
 log "Boot manager: $BOOT_KIND; initramfs: $INITRAMFS_KIND"
 
+HIDE_GRUB_MENU=0
+if [[ "$BOOT_KIND" == grub ]]; then
+    printf 'Hide the GRUB boot menu for smoother hibernation resumes? [y/N] ' > /dev/tty
+    read -r GRUB_MENU_REPLY < /dev/tty || GRUB_MENU_REPLY=""
+    case "$GRUB_MENU_REPLY" in
+        [Yy]|[Yy][Ee][Ss])
+            HIDE_GRUB_MENU=1
+            log 'GRUB menu will be hidden; hold Shift or Esc during boot to show it when needed.'
+            ;;
+        *) log 'Keeping the existing GRUB menu behavior.' ;;
+    esac
+fi
+
 # Python is used only for conservative quoted config edits. CachyOS normally ships it.
 PYTHON=""
 command -v python3 >/dev/null 2>&1 && PYTHON="$(command -v python3)"
@@ -454,9 +467,9 @@ case "$BOOT_KIND" in
 esac
 backup_file "$BOOT_CONF"
 
-"$PYTHON" - "$BOOT_KIND" "$BOOT_CONF" "$RESUME_SPEC" "$RESUME_OFFSET" <<'PY'
+"$PYTHON" - "$BOOT_KIND" "$BOOT_CONF" "$RESUME_SPEC" "$RESUME_OFFSET" "$HIDE_GRUB_MENU" <<'PY'
 import os, re, stat, sys, tempfile
-kind, path, resume, offset = sys.argv[1:]
+kind, path, resume, offset, hide_grub = sys.argv[1:]
 with open(path, 'r', encoding='utf-8') as f:
     lines = f.readlines()
 
@@ -471,6 +484,22 @@ def grub_menu_is_hidden(config):
     return values.get('GRUB_TIMEOUT_STYLE') == 'hidden' or values.get('GRUB_TIMEOUT') == '0'
 
 grub_was_hidden = kind == 'grub' and grub_menu_is_hidden(lines)
+
+def set_grub_option(config, key, value):
+    """Update one active GRUB default while preserving unrelated lines."""
+    pat = re.compile(rf'^(\s*{re.escape(key)}\s*=\s*)(["\']?)(.*?)\2(\s*(?:#.*)?\n?)$')
+    updated = []
+    changed = False
+    for line in config:
+        m = pat.match(line)
+        if m and not line.lstrip().startswith('#'):
+            updated.append(f'{m.group(1)}{m.group(2)}{value}{m.group(2)}{m.group(4)}')
+            changed = True
+        else:
+            updated.append(line)
+    if not changed:
+        updated.append(f'{key}={value}\n')
+    return updated
 
 def clean(v):
     # The values CachyOS writes here are ordinary kernel command lines.
@@ -522,6 +551,9 @@ else:
     raise SystemExit('unsupported boot kind')
 if not changed:
     raise SystemExit('No boot configuration entries could be updated')
+if kind == 'grub' and hide_grub == '1':
+    out = set_grub_option(out, 'GRUB_TIMEOUT_STYLE', 'hidden')
+    out = set_grub_option(out, 'GRUB_TIMEOUT', '0')
 if grub_was_hidden and not grub_menu_is_hidden(out):
     raise SystemExit('Refusing to change an existing hidden GRUB menu')
 
