@@ -19,6 +19,7 @@ Enter your password when asked, choose how many minutes to wait, then reboot whe
 - Creates or uses swap space to save your open apps and games.
 - Makes the normal **Suspend** action sleep first, then hibernate after your chosen delay.
 - Sets up boot/resume settings so the handheld can wake back up where you left off.
+- Optional: hibernates automatically at 15% battery after a short warning period.
 - Makes backups and writes a setup log before changing things.
 
 ## Before you run it

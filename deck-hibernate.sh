@@ -3,9 +3,9 @@ set -Eeuo pipefail
 
 # Deck-Hibernate
 # CachyOS/Arch handheld suspend -> hibernate setup.
-# Prompts only for sudo authentication, the delay, an optional GRUB choice, and the final keypress.
+# Prompts only for sudo authentication, the delay, optional GRUB and battery choices, and the final keypress.
 # Designed to be re-runnable.
-# Version: release-1.0.2
+# Version: release-1.0.3
 
 DEFAULT_DELAY_MINUTES=15
 HIBERNATE_DELAY="${DEFAULT_DELAY_MINUTES}min"
@@ -13,6 +13,8 @@ IMAGE_PERCENT=30
 SWAP_PERCENT=55
 MIN_SWAP_GIB=6
 FREE_RESERVE_GIB=2
+LOW_BATTERY_PERCENT=15
+LOW_BATTERY_DELAY_SECONDS=30
 
 STATE_DIR="/var/lib/cachyos-handheld-hibernate"
 BACKUP_ROOT="$STATE_DIR/backups"
@@ -23,6 +25,9 @@ SLEEP_CONF="/etc/systemd/sleep.conf.d/99-cachyos-handheld-suspend-then-hibernate
 SUSPEND_OVERRIDE_DIR="/etc/systemd/system/systemd-suspend.service.d"
 SUSPEND_OVERRIDE="$SUSPEND_OVERRIDE_DIR/99-cachyos-suspend-then-hibernate.conf"
 IMAGE_SERVICE="/etc/systemd/system/cachyos-hibernate-image-size.service"
+LOW_BATTERY_SCRIPT="/usr/local/lib/cachyos-handheld-hibernate/low-battery-hibernate"
+LOW_BATTERY_SERVICE="/etc/systemd/system/cachyos-hibernate-low-battery.service"
+LOW_BATTERY_TIMER="/etc/systemd/system/cachyos-hibernate-low-battery.timer"
 DRACUT_CONF="/etc/dracut.conf.d/99-cachyos-hibernate.conf"
 
 # Keep the user's terminal available while logging setup details quietly.
@@ -74,6 +79,31 @@ ask_delay() {
     done
 }
 ask_delay
+
+LOW_BATTERY_MODE=keep
+ask_low_battery() {
+    local reply
+
+    compgen -G '/sys/class/power_supply/BAT*/capacity' >/dev/null || return 0
+    [[ -r /dev/tty && -w /dev/tty ]] || return 0
+
+    if systemctl is-enabled --quiet cachyos-hibernate-low-battery.timer 2>/dev/null; then
+        printf 'Automatic low-battery hibernation is already enabled. Keep it enabled? [Y/n] ' > /dev/tty
+        read -r reply < /dev/tty || reply=""
+        case "$reply" in
+            [Nn]|[Nn][Oo]) LOW_BATTERY_MODE=disable ;;
+            *) LOW_BATTERY_MODE=keep ;;
+        esac
+    else
+        printf 'Hibernate automatically at %s%% battery? It waits %s seconds first. [y/N] ' "$LOW_BATTERY_PERCENT" "$LOW_BATTERY_DELAY_SECONDS" > /dev/tty
+        read -r reply < /dev/tty || reply=""
+        case "$reply" in
+            [Yy]|[Yy][Ee][Ss]) LOW_BATTERY_MODE=enable ;;
+            *) LOW_BATTERY_MODE=keep ;;
+        esac
+    fi
+}
+ask_low_battery
 
 mkdir -p "$(dirname "$LOG_FILE")" "$STATE_DIR" "$BACKUP_ROOT"
 touch "$LOG_FILE"
@@ -622,6 +652,76 @@ systemctl daemon-reload
 systemctl enable cachyos-hibernate-image-size.service
 printf '%s' "$IMAGE_BYTES" > /sys/power/image_size
 
+case "$LOW_BATTERY_MODE" in
+    enable)
+        CURRENT_STEP="configuring low-battery hibernation"
+        mkdir -p "$(dirname "$LOW_BATTERY_SCRIPT")"
+        backup_file "$LOW_BATTERY_SCRIPT"
+        backup_file "$LOW_BATTERY_SERVICE"
+        backup_file "$LOW_BATTERY_TIMER"
+
+        cat > "$LOW_BATTERY_SCRIPT" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+THRESHOLD=$LOW_BATTERY_PERCENT
+WAIT_SECONDS=$LOW_BATTERY_DELAY_SECONDS
+
+is_low_and_discharging() {
+    local battery status capacity lowest=101 found=0
+    for battery in /sys/class/power_supply/BAT*; do
+        [[ -r "\$battery/status" && -r "\$battery/capacity" ]] || continue
+        status="\$(<"\$battery/status")"
+        capacity="\$(<"\$battery/capacity")"
+        [[ "\$capacity" =~ ^[0-9]+$ ]] || continue
+        [[ "\$status" == Discharging ]] || continue
+        found=1
+        (( capacity < lowest )) && lowest=\$capacity
+    done
+    (( found && lowest <= THRESHOLD ))
+}
+
+is_low_and_discharging || exit 0
+logger -t cachyos-hibernate-low-battery "Battery is at or below \${THRESHOLD}%; hibernating in \${WAIT_SECONDS} seconds unless AC is connected."
+sleep "\$WAIT_SECONDS"
+is_low_and_discharging || exit 0
+logger -t cachyos-hibernate-low-battery 'Battery is still low; starting emergency hibernation.'
+exec systemctl hibernate --ignore-inhibitors
+EOF
+        chmod 700 "$LOW_BATTERY_SCRIPT"
+
+        cat > "$LOW_BATTERY_SERVICE" <<EOF
+[Unit]
+Description=Hibernate CachyOS handheld on low battery
+
+[Service]
+Type=oneshot
+ExecStart=$LOW_BATTERY_SCRIPT
+EOF
+
+        cat > "$LOW_BATTERY_TIMER" <<'EOF'
+[Unit]
+Description=Check CachyOS handheld battery level
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=15s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+EOF
+        systemctl daemon-reload
+        systemctl enable --now cachyos-hibernate-low-battery.timer
+        log "Automatic low-battery hibernation enabled at ${LOW_BATTERY_PERCENT}% after ${LOW_BATTERY_DELAY_SECONDS} seconds."
+        ;;
+    disable)
+        CURRENT_STEP="disabling low-battery hibernation"
+        systemctl disable --now cachyos-hibernate-low-battery.timer 2>/dev/null || true
+        log 'Automatic low-battery hibernation disabled.'
+        ;;
+esac
+
 CURRENT_STEP="rebuilding initramfs and boot entries"
 case "$INITRAMFS_KIND" in
     mkinitcpio)
@@ -669,6 +769,10 @@ CURRENT_STEP="final verification"
 grep -Fq 'HibernateDelaySec=' "$SLEEP_CONF"
 grep -Fq 'suspend-then-hibernate' "$SUSPEND_OVERRIDE"
 systemd-analyze verify "$IMAGE_SERVICE" >/dev/null
+if [[ "$LOW_BATTERY_MODE" == enable ]]; then
+    systemd-analyze verify "$LOW_BATTERY_SERVICE" "$LOW_BATTERY_TIMER" >/dev/null
+    systemctl is-enabled --quiet cachyos-hibernate-low-battery.timer
+fi
 
 if [[ "$SWAP_TYPE" == file || -f "$SWAP_PATH" ]]; then
     grep -Fq "$SWAP_PATH" /proc/swaps || { echo 'Selected swapfile is not active'; exit 1; }
@@ -688,6 +792,9 @@ RESUME_OFFSET=$RESUME_OFFSET
 ROOT_FSTYPE=$ROOT_FSTYPE
 BOOT_KIND=$BOOT_KIND
 INITRAMFS_KIND=$INITRAMFS_KIND
+LOW_BATTERY_MODE=$LOW_BATTERY_MODE
+LOW_BATTERY_PERCENT=$LOW_BATTERY_PERCENT
+LOW_BATTERY_DELAY_SECONDS=$LOW_BATTERY_DELAY_SECONDS
 LAST_BACKUP=$BACKUP_DIR
 EOF
 chmod 600 "$STATE_DIR/state.env"
