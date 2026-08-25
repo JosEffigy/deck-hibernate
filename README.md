@@ -1,5 +1,7 @@
 # Deck-Hibernate
 
+![Deck-Hibernate banner](assets/deck-hibernate-banner.png)
+
 Suspend-then-hibernate installer for CachyOS and Arch Linux gaming handhelds. It makes a device sleep normally, then hibernate after a while (15 minutes by default) to reduce battery drain and heat. It is suitable for Steam Deck hardware running CachyOS or another supported Arch-based setup.
 
 ## Install
