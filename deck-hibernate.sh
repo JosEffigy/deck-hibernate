@@ -460,6 +460,18 @@ kind, path, resume, offset = sys.argv[1:]
 with open(path, 'r', encoding='utf-8') as f:
     lines = f.readlines()
 
+def grub_menu_is_hidden(config):
+    """Return whether the existing GRUB defaults intentionally hide the menu."""
+    values = {}
+    pat = re.compile(r'^\s*(GRUB_TIMEOUT(?:_STYLE)?)\s*=\s*(["\']?)(.*?)\2\s*(?:#.*)?$')
+    for line in config:
+        m = pat.match(line.rstrip('\n'))
+        if m and not line.lstrip().startswith('#'):
+            values[m.group(1)] = m.group(3).strip()
+    return values.get('GRUB_TIMEOUT_STYLE') == 'hidden' or values.get('GRUB_TIMEOUT') == '0'
+
+grub_was_hidden = kind == 'grub' and grub_menu_is_hidden(lines)
+
 def clean(v):
     # The values CachyOS writes here are ordinary kernel command lines.
     parts = [p for p in v.split() if not (p.startswith('resume=') or p.startswith('resume_offset=') or p == 'hibernate=nocompress')]
@@ -510,6 +522,8 @@ else:
     raise SystemExit('unsupported boot kind')
 if not changed:
     raise SystemExit('No boot configuration entries could be updated')
+if grub_was_hidden and not grub_menu_is_hidden(out):
+    raise SystemExit('Refusing to change an existing hidden GRUB menu')
 
 directory = os.path.dirname(path) or '.'
 original = os.stat(path)
