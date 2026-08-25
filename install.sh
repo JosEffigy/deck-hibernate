@@ -2,7 +2,7 @@
 # Download and run the current Deck-Hibernate setup script.
 set -Eeuo pipefail
 
-SCRIPT_URL="https://raw.githubusercontent.com/JosEffigy/deck-hibernate/master/deck-hibernate.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/JosEffigy/deck-hibernate/main/deck-hibernate.sh"
 TEMP_DIR="$(mktemp -d)"
 TEMP_SCRIPT="$TEMP_DIR/deck-hibernate.sh"
 

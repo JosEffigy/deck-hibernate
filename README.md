@@ -7,7 +7,7 @@ Makes a CachyOS or Arch Linux handheld sleep normally, then hibernate after a wh
 Run this in Konsole/Terminal on the handheld:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/JosEffigy/deck-hibernate/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/JosEffigy/deck-hibernate/main/install.sh | bash
 ```
 
 Enter your password when asked, choose how many minutes to wait, then reboot when it finishes.

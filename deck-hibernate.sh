@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # CachyOS/Arch handheld suspend -> hibernate setup.
 # Prompts only for sudo authentication, the delay, an optional GRUB choice, and the final keypress.
 # Designed to be re-runnable.
-# Version: release-1.0.1
+# Version: release-1.0.2
 
 DEFAULT_DELAY_MINUTES=15
 HIBERNATE_DELAY="${DEFAULT_DELAY_MINUTES}min"
