@@ -101,7 +101,7 @@ ask_low_battery() {
         read -r reply < /dev/tty || reply=""
         case "$reply" in
             [Nn]|[Nn][Oo]) LOW_BATTERY_MODE=disable ;;
-            *) LOW_BATTERY_MODE=keep ;;
+            *) LOW_BATTERY_MODE=enable ;;
         esac
     else
         printf 'Hibernate automatically at %s%% battery? It waits %s seconds first. [y/N] ' "$LOW_BATTERY_PERCENT" "$LOW_BATTERY_DELAY_SECONDS" > /dev/tty

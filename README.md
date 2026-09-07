@@ -24,7 +24,7 @@ Enter your password when asked, choose how many minutes to wait, then reboot whe
 
 ## Before you run it
 
-- Supports CachyOS/Arch and Bazzite. Bazzite is detected automatically: versions before 44 use the pre-44 path; 44 and newer use the OpenGamepadUI/InputPlumber-era path.
+- CachyOS/Arch, plus experimental Bazzite support. Pre-44 and 44+ are detected and labelled; both use the same systemd installer. Bazzite hardware resume testing is still pending.
 - On Bazzite, it creates a persistent Btrfs swapfile and disables zram so normal systemd hibernation can resume after a reboot. It does not use HHD, so pre-44 installs do not depend on HHD's dynamic hibernation.
 - You need internet and `curl` or `wget` for the online install.
 - It **does not** install missing packages. If a needed system tool is missing, it stops and tells you.

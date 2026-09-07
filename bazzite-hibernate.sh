@@ -42,7 +42,8 @@ case "${ID:-}" in
     *) echo "This Bazzite installer was started on '${ID:-unknown}', not Bazzite."; exit 1 ;;
 esac
 
-BAZZITE_MAJOR="${VERSION_ID%%.*}"
+BAZZITE_MAJOR="${VERSION_ID:-}"
+BAZZITE_MAJOR="${BAZZITE_MAJOR%%.*}"
 [[ "$BAZZITE_MAJOR" =~ ^[0-9]+$ ]] || { echo "Could not determine Bazzite version from VERSION_ID=${VERSION_ID:-unknown}."; exit 1; }
 if (( BAZZITE_MAJOR >= 44 )); then
     BAZZITE_GENERATION='44+ (OpenGamepadUI/InputPlumber)'
@@ -114,7 +115,7 @@ backup_file() {
 require_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Missing required command: $1"; exit 1; }; }
 
 CURRENT_STEP='checking Bazzite support'
-for cmd in systemctl findmnt btrfs swapon mkswap awk df rpm-ostree semanage restorecon blkid; do require_cmd "$cmd"; done
+for cmd in systemctl systemd-analyze findmnt btrfs swapon mkswap awk df rpm-ostree semanage restorecon blkid stat python3; do require_cmd "$cmd"; done
 [[ -r /sys/power/state ]] || { echo '/sys/power/state is unavailable'; exit 1; }
 grep -qw disk /sys/power/state || { echo 'This kernel does not expose hibernation.'; exit 1; }
 grep -qw mem /sys/power/state || { echo 'This kernel does not expose suspend.'; exit 1; }
@@ -138,9 +139,16 @@ if (( BAZZITE_MAJOR < 44 )); then
 fi
 
 CURRENT_STEP='creating Bazzite hibernation swap'
-AVAILABLE_KIB="$(df -Pk /var | awk 'NR==2 {print $4}')"
-NEEDED_KIB=$(( TARGET_SWAP_KIB + FREE_RESERVE_GIB * 1024 * 1024 ))
-(( AVAILABLE_KIB >= NEEDED_KIB )) || { echo "Not enough free space: need ${NEEDED_KIB} KiB, have ${AVAILABLE_KIB} KiB."; exit 1; }
+[[ ! -L "$SWAP_DIR" && ! -L "$SWAP_FILE" ]] || { echo 'Refusing symlinked swap paths.'; exit 1; }
+if [[ ! -e "$SWAP_FILE" ]]; then
+    AVAILABLE_KIB="$(df -Pk /var | awk 'NR==2 {print $4}')"
+    NEEDED_KIB=$(( TARGET_SWAP_KIB + FREE_RESERVE_GIB * 1024 * 1024 ))
+    (( AVAILABLE_KIB >= NEEDED_KIB )) || { echo "Not enough free space: need ${NEEDED_KIB} KiB, have ${AVAILABLE_KIB} KiB."; exit 1; }
+else
+    [[ -f "$SWAP_FILE" && "$(blkid -p -s TYPE -o value "$SWAP_FILE")" == swap ]] || { echo 'Existing managed file is not valid swap; refusing to overwrite it.'; exit 1; }
+    (( $(stat -c %s "$SWAP_FILE") >= TARGET_SWAP_KIB * 1024 )) || { echo 'Existing swapfile is too small; refusing to resize it automatically.'; exit 1; }
+    btrfs inspect-internal map-swapfile -r "$SWAP_FILE" >/dev/null
+fi
 
 if [[ ! -e "$SWAP_DIR" ]]; then
     btrfs subvolume create "$SWAP_DIR"
@@ -148,18 +156,13 @@ elif ! btrfs subvolume show "$SWAP_DIR" >/dev/null 2>&1; then
     echo "$SWAP_DIR exists but is not a Btrfs subvolume; refusing to alter it."
     exit 1
 fi
-semanage fcontext -a -t var_t "$SWAP_DIR(/.*)?" 2>/dev/null || semanage fcontext -m -t var_t "$SWAP_DIR(/.*)?"
-restorecon -RFv "$SWAP_DIR" >/dev/null
-
-if [[ -f "$SWAP_FILE" ]] && ! grep -Fq "$SWAP_FILE" /proc/swaps; then
-    echo "Managed swapfile exists but is inactive: $SWAP_FILE. Refusing to overwrite it."
-    exit 1
-fi
+semanage fcontext -a -t var_t "$SWAP_DIR" 2>/dev/null || semanage fcontext -m -t var_t "$SWAP_DIR"
+restorecon -v "$SWAP_DIR" >/dev/null
 if [[ ! -f "$SWAP_FILE" ]]; then
     btrfs filesystem mkswapfile --size "$(( TARGET_SWAP_KIB * 1024 ))" --uuid clear "$SWAP_FILE"
-    semanage fcontext -a -t swapfile_t "$SWAP_FILE" 2>/dev/null || semanage fcontext -m -t swapfile_t "$SWAP_FILE"
-    restorecon -v "$SWAP_FILE" >/dev/null
 fi
+semanage fcontext -a -t swapfile_t "$SWAP_FILE" 2>/dev/null || semanage fcontext -m -t swapfile_t "$SWAP_FILE"
+restorecon -v "$SWAP_FILE" >/dev/null
 chmod 600 "$SWAP_FILE"
 grep -Fq "$SWAP_FILE" /proc/swaps || swapon "$SWAP_FILE"
 backup_file /etc/fstab
@@ -178,9 +181,17 @@ RESUME_UUID="$(blkid -s UUID -o value "$RESUME_SOURCE" 2>/dev/null || true)"
 [[ -n "$RESUME_UUID" ]] || { echo "Could not obtain UUID for $RESUME_SOURCE."; exit 1; }
 RESUME_ARG="resume=UUID=$RESUME_UUID"
 OFFSET_ARG="resume_offset=$RESUME_OFFSET"
-rpm-ostree kargs --append-if-missing="$RESUME_ARG" --append-if-missing="$OFFSET_ARG"
-rpm-ostree kargs | grep -Fxq "$RESUME_ARG" || { echo "rpm-ostree did not retain $RESUME_ARG"; exit 1; }
-rpm-ostree kargs | grep -Fxq "$OFFSET_ARG" || { echo "rpm-ostree did not retain $OFFSET_ARG"; exit 1; }
+CURRENT_KARGS="$(rpm-ostree kargs)"
+printf '%s\n' "$CURRENT_KARGS" >"$BACKUP_DIR/kernel-arguments.txt"
+# Parse quoted arguments without shell evaluation; preserve unrelated arguments.
+OLD_RESUME_ARGS="$(python3 -c 'import shlex,sys; print("\n".join(dict.fromkeys(x for x in shlex.split(sys.argv[1]) if x.startswith(("resume=", "resume_offset=")))))' "$CURRENT_KARGS")"
+KARGS_OPTIONS=()
+while IFS= read -r argument; do
+    [[ -n "$argument" ]] && KARGS_OPTIONS+=("--delete=$argument")
+done <<<"$OLD_RESUME_ARGS"
+rpm-ostree kargs "${KARGS_OPTIONS[@]}" --append="$RESUME_ARG" --append="$OFFSET_ARG"
+NEW_KARGS="$(rpm-ostree kargs)"
+python3 -c 'import shlex,sys; args=shlex.split(sys.argv[1]); actual=[x for x in args if x.startswith(("resume=", "resume_offset="))]; sys.exit(0 if sorted(actual)==sorted(sys.argv[2:]) else 1)' "$NEW_KARGS" "$RESUME_ARG" "$OFFSET_ARG" || { echo 'Resume argument verification failed.'; exit 1; }
 
 CURRENT_STEP='disabling zram for persistent hibernation'
 backup_file "$ZRAM_CONF"
@@ -203,7 +214,7 @@ ExecStart=
 ExecStart=$SYSTEMD_SLEEP suspend-then-hibernate
 EOF
 systemctl daemon-reload
-systemd-analyze verify "$SUSPEND_DROPIN" >/dev/null
+systemd-analyze verify systemd-suspend.service >/dev/null
 
 case "$LOW_BATTERY_MODE" in
     enable)
@@ -268,7 +279,8 @@ WantedBy=multi-user.target
 EOF
         systemctl daemon-reload
         systemd-analyze verify "$LOW_BATTERY_SERVICE" >/dev/null
-        systemctl enable --now deck-hibernate-low-battery.service
+        # Resume arguments become active only after reboot.
+        systemctl enable deck-hibernate-low-battery.service
         ;;
     disable)
         systemctl disable --now deck-hibernate-low-battery.service 2>/dev/null || true

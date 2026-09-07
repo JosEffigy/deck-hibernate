@@ -27,7 +27,7 @@ fi
 chmod 700 "$TEMP_SCRIPT"
 chmod 700 "$BAZZITE_SCRIPT"
 
-if [[ -r /etc/os-release ]] && grep -Eq '^ID=bazzite$' /etc/os-release; then
+if [[ -r /etc/os-release ]] && ( . /etc/os-release; [[ "${ID:-}" == bazzite ]] ); then
     "$BAZZITE_SCRIPT"
 else
     "$TEMP_SCRIPT"
